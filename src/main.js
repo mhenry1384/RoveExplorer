@@ -1,10 +1,13 @@
 import './style.css';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { homeDir } from '@tauri-apps/api/path';
+import { homeDir, sep } from '@tauri-apps/api/path';
 import { openPath } from '@tauri-apps/plugin-opener';
 import configuredFolders from '../config/folders.json';
 
+const SEP = sep();
+const isWindows = SEP === '\\';
+const COMPUTER_LABEL = isWindows ? 'This PC' : 'This Mac';
 const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], contextMenu: null };
 const stored = JSON.parse(localStorage.getItem('rove-state') || '{}');
 const session = JSON.parse(localStorage.getItem('rove-session') || '{}');
@@ -13,7 +16,7 @@ let lastEntryClick = { id: null, time: 0 };
 let entryClickTimer = null;
 let lastWatchedKey = '';
 const fsChangeTimers = new Map();
-function normalizePath(path) { return path.replace(/\//g, '\\').replace(/[\\]+$/, '').toLowerCase(); }
+function normalizePath(path) { return path.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase(); }
 
 function currentTab(pane) { return pane.tabs[pane.activeTab]; }
 function extension(name) { const dot = name.lastIndexOf('.'); return dot > 0 ? name.slice(dot) : '—'; }
@@ -42,13 +45,22 @@ function folderIcon(path) { const name = path.replace(/[\\/]+$/, '').split(/[\\/
 function folderLabel(path) { return path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'Home'; }
 function pathSegments(path) {
   const parts = path.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean);
+  if (!isWindows && path.startsWith('/')) {
+    let acc = '';
+    return parts.map((part) => { acc += `/${part}`; return { label: part, path: acc }; });
+  }
   let acc = '';
   return parts.map((part, i) => {
     acc = i === 0 ? (/^[A-Za-z]:$/.test(part) ? `${part}\\` : part) : (acc.endsWith('\\') ? `${acc}${part}` : `${acc}\\${part}`);
     return { label: part, path: acc };
   });
 }
-async function resolveFolderPath(path) { return path.startsWith('~') ? `${await homeDir()}${path.slice(1).replaceAll('/', '\\')}` : path; }
+async function resolveFolderPath(path) {
+  if (!path.startsWith('~')) return path;
+  const rest = path.slice(1).split(/[\\/]+/).filter(Boolean);
+  const home = (await homeDir()).replace(/[\\/]+$/, '');
+  return [home, ...rest].join(SEP);
+}
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -158,7 +170,7 @@ function renderPane(pane, index) {
   const rows = entries.map((entry, entryIndex) => { const editing = isEditing(index, entry); const name = editing ? `<input class="rename-input" data-rename value="${escapeAttribute(entry.name)}" aria-label="Rename">` : `<strong>${entry.displayName}</strong>`; return `<button class="file-row ${isDriveRoot ? 'drive-row' : ''} ${selected === entry.id ? 'selected' : ''}" data-entry="${entry.id}" data-index="${entryIndex}"><span class="file-name">${renderFileIcon(entry)}${name}</span><span>${isDriveRoot ? entry.total : entry.extension}</span><span>${isDriveRoot ? entry.free : entry.size}</span><span>${isDriveRoot ? entry.fileSystem : (entry.modified === '—' ? '—' : new Date(Number(entry.modified) * 1000).toLocaleDateString('en', { month: 'short', day: 'numeric', year: 'numeric' }))}</span></button>`; }).join('') || '<div class="empty-state"><span>⌁</span><strong>This folder is empty</strong><small>Choose another location to keep moving.</small></div>';
   const breadcrumb = tab?.path
     ? pathSegments(tab.path).map((segment, segIndex) => `${segIndex > 0 ? '<span class="path-sep">/</span>' : ''}<button class="path-segment" data-breadcrumb="${escapeAttribute(segment.path)}">${escapeAttribute(segment.label)}</button>`).join('')
-    : '<span class="path-segment path-segment-static">This PC</span>';
+    : `<span class="path-segment path-segment-static">${COMPUTER_LABEL}</span>`;
   const body = view === 'tree'
     ? `<div class="table-wrap tree-wrap">${renderTreeBody(tab)}</div>`
     : view === 'thumbnails'
@@ -183,7 +195,7 @@ async function navigateTabTo(index, path, { recordHistory = true, historyIndex }
   if (!tab) return;
   state.activePane = index;
   const entries = path ? await load(path) : await loadDrives();
-  tab.path = path; tab.kind = path ? 'folder' : 'drives'; tab.label = path ? (path.split(/[\\/]/).filter(Boolean).pop() || path) : 'This PC'; tab.entries = entries;
+  tab.path = path; tab.kind = path ? 'folder' : 'drives'; tab.label = path ? (path.split(/[\\/]/).filter(Boolean).pop() || path) : COMPUTER_LABEL; tab.entries = entries;
   tab.selected = path && stored[path]?.name ? entries.find((entry) => entry.name === stored[path].name)?.id || null : null;
   if (recordHistory) pushHistory(tab, path); else if (historyIndex !== undefined) tab.historyIndex = historyIndex;
   saveSession(); render();
@@ -276,7 +288,19 @@ async function enter(paneIndex, entry) {
   if (entry.kind === 'drive' || entry.kind === 'folder') { await navigateTabTo(paneIndex, entry.path); } else { try { await openPath(entry.path); } catch (error) { console.error('openPath failed', entry.path, error); } }
 }
 
-async function goUp(index) { const tab = currentTab(state.panes[index]); if (!tab || !tab.path) return; const trimmed = tab.path.replace(/[\\/]+$/, ''); let parent = /^[A-Za-z]:$/.test(trimmed) || trimmed === '' ? '' : trimmed.replace(/[\\/][^\\/]+$/, '') || ''; if (/^[A-Za-z]:$/.test(parent)) parent += '\\'; await navigateTabTo(index, parent); }
+async function goUp(index) {
+  const tab = currentTab(state.panes[index]); if (!tab || !tab.path) return;
+  const trimmed = tab.path.replace(/[\\/]+$/, '');
+  let parent;
+  if (!isWindows && tab.path.startsWith('/')) {
+    if (trimmed === '') { parent = ''; }
+    else { const lastSlash = trimmed.lastIndexOf('/'); parent = lastSlash <= 0 ? '/' : trimmed.slice(0, lastSlash); }
+  } else {
+    parent = /^[A-Za-z]:$/.test(trimmed) || trimmed === '' ? '' : trimmed.replace(/[\\/][^\\/]+$/, '') || '';
+    if (/^[A-Za-z]:$/.test(parent)) parent += '\\';
+  }
+  await navigateTabTo(index, parent);
+}
 
 function moveSelection(index, direction) { const pane = state.panes[index]; const tab = currentTab(pane); const entries = tab?.entries || []; if (!entries.length) return; const current = entries.findIndex((entry) => entry.id === tab.selected); const next = current < 0 ? (direction > 0 ? 0 : entries.length - 1) : Math.max(0, Math.min(entries.length - 1, current + direction)); tab.selected = entries[next].id; if (tab.path) remember(tab.path, entries[next].name); saveSession(); render(); }
 
@@ -372,7 +396,7 @@ function bindEvents() {
       });
     });
     element.querySelectorAll('[data-tab]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); state.activePane = index; pane.activeTab = Number(button.dataset.tab); saveSession(); render(); }));
-    element.querySelector('[data-new-tab]').addEventListener('click', async (event) => { event.stopPropagation(); const current = currentTab(pane); const path = current?.path || ''; pane.tabs.push(path ? { path, kind: 'folder', label: path.split(/[\\/]/).pop(), entries: await load(path), selected: null, history: [path], historyIndex: 0 } : { path: '', kind: 'drives', label: 'This PC', entries: await loadDrives(), selected: null, history: [''], historyIndex: 0 }); pane.activeTab = pane.tabs.length - 1; saveSession(); render(); });
+    element.querySelector('[data-new-tab]').addEventListener('click', async (event) => { event.stopPropagation(); const current = currentTab(pane); const path = current?.path || ''; pane.tabs.push(path ? { path, kind: 'folder', label: path.split(/[\\/]/).pop(), entries: await load(path), selected: null, history: [path], historyIndex: 0 } : { path: '', kind: 'drives', label: COMPUTER_LABEL, entries: await loadDrives(), selected: null, history: [''], historyIndex: 0 }); pane.activeTab = pane.tabs.length - 1; saveSession(); render(); });
     element.querySelector('[data-up]').addEventListener('click', (event) => { event.stopPropagation(); goUp(index); });
     element.querySelectorAll('[data-breadcrumb]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); navigateToPath(index, button.dataset.breadcrumb); }));
     const viewSelectEl = element.querySelector('[data-view-select]');
@@ -444,7 +468,7 @@ async function start() {
   const savedPanes = Array.isArray(session.panes) ? session.panes : [];
   for (let index = 0; index < state.panes.length; index += 1) {
     const saved = savedPanes[index];
-    const tabs = saved?.tabs?.length ? await Promise.all(saved.tabs.map(async (item) => item.path ? { ...item, kind: 'folder', entries: await load(item.path), history: [item.path], historyIndex: 0 } : { path: '', kind: 'drives', label: 'This PC', entries: drives, selected: item.selected ?? null, history: [''], historyIndex: 0 })) : [{ path: '', kind: 'drives', label: 'This PC', entries: drives, selected: null, history: [''], historyIndex: 0 }];
+    const tabs = saved?.tabs?.length ? await Promise.all(saved.tabs.map(async (item) => item.path ? { ...item, kind: 'folder', entries: await load(item.path), history: [item.path], historyIndex: 0 } : { path: '', kind: 'drives', label: COMPUTER_LABEL, entries: drives, selected: item.selected ?? null, history: [''], historyIndex: 0 })) : [{ path: '', kind: 'drives', label: COMPUTER_LABEL, entries: drives, selected: null, history: [''], historyIndex: 0 }];
     state.panes[index] = { tabs, activeTab: Math.min(saved?.activeTab || 0, tabs.length - 1) };
   }
   render();

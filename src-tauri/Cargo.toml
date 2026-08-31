@@ -22,6 +22,9 @@ notify = "6"
 trash = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+[target.'cfg(not(windows))'.dependencies]
+sysinfo = { version = "0.39.6", default-features = false, features = ["disk"] }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

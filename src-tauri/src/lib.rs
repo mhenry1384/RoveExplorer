@@ -108,7 +108,25 @@ fn list_drives() -> Vec<Drive> {
 #[cfg(not(windows))]
 #[tauri::command]
 fn list_drives() -> Vec<Drive> {
-    Vec::new()
+    let mut drives: Vec<Drive> = sysinfo::Disks::new_with_refreshed_list()
+        .list()
+        .iter()
+        .map(|disk| {
+            let path = disk.mount_point().to_string_lossy().to_string();
+            let label = disk.name().to_string_lossy().to_string();
+            let name = if label.is_empty() { path.clone() } else { label };
+            Drive {
+                kind: "drive".to_string(),
+                name,
+                path,
+                total: format_size(disk.total_space()),
+                free: format_size(disk.available_space()),
+                file_system: disk.file_system().to_string_lossy().to_string(),
+            }
+        })
+        .collect();
+    drives.sort_by(|left, right| left.path.cmp(&right.path));
+    drives
 }
 
 #[tauri::command]
