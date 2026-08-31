@@ -19,7 +19,7 @@ html, body, #app { height: 100%; overflow: hidden; }
 
 @media (max-width: 700px) { .panes { grid-template-rows: repeat(2, minmax(0, 1fr)); }.pane, .panes .pane:nth-child(2) { min-height: 0; } }
 
-.folder-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; min-height: 74px; margin-bottom: 12px; padding: 8px 10px; overflow-x: auto; border: 1px solid var(--line); background: rgba(252,252,249,.7); }
+.folder-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; min-height: 74px; margin-bottom: 12px; padding: 8px 10px; overflow-x: auto; border: 1px solid var(--line); background: rgba(252,252,249,.7); }.nav-history-button { flex: 0 0 auto; width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid var(--line); background: transparent; color: var(--ink); font-size: 16px; }.nav-history-button:hover:not(:disabled) { border-color: #a9b168; background: #f4f7df; }.nav-history-button:disabled { color: #c7c9c0; cursor: default; }.toolbar-separator { flex: 0 0 auto; width: 1px; align-self: stretch; margin: 4px 2px; background: var(--line); }
 .quick-folder { flex: 0 0 auto; min-width: 76px; height: 56px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; border: 1px solid transparent; background: transparent; color: var(--muted); font: 9px 'DM Mono'; }
 .quick-folder img { width: 27px; height: 27px; object-fit: contain; }
 .quick-folder:hover, .quick-folder:focus-visible { border-color: #c8d18b; background: #f4f7df; color: var(--ink); outline: none; }

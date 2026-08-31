@@ -70,7 +70,10 @@ function render() {
   const activeTab = currentTab(state.panes[state.activePane]);
   const pathValue = activeTab?.path || '';
   const toolbar = state.folders.map((folder) => `<button class="quick-folder" data-folder-path="${escapeAttribute(folder.path)}" title="Open ${escapeAttribute(folder.path)}"><img src="/folder-icons/${folderIcon(folder.path)}.svg" alt=""><span>${escapeAttribute(folder.label)}</span></button>`).join('');
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin</span></footer>${renderContextMenu()}`;
+  const canGoBack = (activeTab?.historyIndex ?? 0) > 0;
+  const canGoForward = !!activeTab && activeTab.historyIndex < (activeTab.history?.length ?? 1) - 1;
+  const navHistory = `<button class="nav-history-button" data-go-back title="Back" aria-label="Go back" ${canGoBack ? '' : 'disabled'}>←</button><button class="nav-history-button" data-go-forward title="Forward" aria-label="Go forward" ${canGoForward ? '' : 'disabled'}>→</button><span class="toolbar-separator" aria-hidden="true"></span>`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin</span></footer>${renderContextMenu()}`;
   bindEvents();
   const selectedRow = document.querySelector(`.pane[data-pane="${state.activePane}"] .file-row.selected, .pane[data-pane="${state.activePane}"] .thumb-card.selected`);
   selectedRow?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -165,13 +168,43 @@ function renderPane(pane, index) {
   return `<article class="pane ${state.activePane === index ? 'is-active' : ''}" data-pane="${index}"><div class="tabs">${pane.tabs.map((item, tabIndex) => `<button class="tab ${tabIndex === pane.activeTab ? 'active' : ''}" data-tab="${tabIndex}"><span class="tab-dot"></span>${item.label}<span class="tab-close">×</span></button>`).join('')}<button class="new-tab" data-new-tab title="New tab">＋</button></div><div class="pathbar"><button class="nav-button" data-up title="Go up one level" aria-label="Go up one level">↑</button><div class="path-text">${breadcrumb}</div><span class="item-count">${entries.length} ITEMS</span></div>${body}<div class="pane-footer"><span class="selection-label">${selected ? '1 SELECTED' : 'NOTHING SELECTED'}</span>${viewSelect}</div></article>`;
 }
 
-async function navigatePath(path) {
-  const pane = state.panes[state.activePane]; const tab = currentTab(pane); const normalized = path.trim();
-  if (!tab || !normalized) return;
-  const entries = await load(normalized);
-  tab.path = normalized; tab.kind = 'folder'; tab.label = normalized.split(/[\\/]/).filter(Boolean).pop() || normalized; tab.entries = entries;
-  tab.selected = stored[normalized]?.name ? entries.find((entry) => entry.name === stored[normalized].name)?.id || null : null;
+const HISTORY_LIMIT = 25;
+function pushHistory(tab, path) {
+  if (!tab.history) { tab.history = [path]; tab.historyIndex = 0; return; }
+  if (tab.history[tab.historyIndex] === path) return;
+  tab.history = tab.history.slice(0, tab.historyIndex + 1);
+  tab.history.push(path);
+  if (tab.history.length > HISTORY_LIMIT) tab.history.shift();
+  tab.historyIndex = tab.history.length - 1;
+}
+
+async function navigateTabTo(index, path, { recordHistory = true, historyIndex } = {}) {
+  const pane = state.panes[index]; const tab = currentTab(pane);
+  if (!tab) return;
+  state.activePane = index;
+  const entries = path ? await load(path) : await loadDrives();
+  tab.path = path; tab.kind = path ? 'folder' : 'drives'; tab.label = path ? (path.split(/[\\/]/).filter(Boolean).pop() || path) : 'This PC'; tab.entries = entries;
+  tab.selected = path && stored[path]?.name ? entries.find((entry) => entry.name === stored[path].name)?.id || null : null;
+  if (recordHistory) pushHistory(tab, path); else if (historyIndex !== undefined) tab.historyIndex = historyIndex;
   saveSession(); render();
+}
+
+function goBack(index) {
+  const tab = currentTab(state.panes[index]);
+  if (!tab?.history || tab.historyIndex <= 0) return;
+  navigateTabTo(index, tab.history[tab.historyIndex - 1], { recordHistory: false, historyIndex: tab.historyIndex - 1 });
+}
+
+function goForward(index) {
+  const tab = currentTab(state.panes[index]);
+  if (!tab?.history || tab.historyIndex >= tab.history.length - 1) return;
+  navigateTabTo(index, tab.history[tab.historyIndex + 1], { recordHistory: false, historyIndex: tab.historyIndex + 1 });
+}
+
+async function navigatePath(path) {
+  const normalized = path.trim();
+  if (!currentTab(state.panes[state.activePane]) || !normalized) return;
+  await navigateTabTo(state.activePane, normalized);
 }
 
 function startRename(index, entry) { state.activePane = index; state.editing = { pane: index, entryId: entry.id, original: entry.name }; render(); const input = document.querySelector('[data-rename]'); input?.focus(); input?.select(); }
@@ -234,21 +267,16 @@ async function deleteTreeNode(index, path) {
 }
 
 async function navigateToPath(index, path) {
-  const pane = state.panes[index]; const tab = currentTab(pane);
-  state.activePane = index;
-  const entries = await load(path);
-  tab.path = path; tab.kind = 'folder'; tab.label = path.split(/[\\/]/).filter(Boolean).pop() || path; tab.entries = entries;
-  tab.selected = stored[path]?.name ? entries.find((child) => child.name === stored[path].name)?.id || null : null;
-  saveSession(); render();
+  await navigateTabTo(index, path);
 }
 
 async function enter(paneIndex, entry) {
   if (!entry) return;
-  const pane = state.panes[paneIndex]; const tab = currentTab(pane); remember(tab.path, entry.name);
-  if (entry.kind === 'drive' || entry.kind === 'folder') { tab.path = entry.path; tab.kind = entry.kind === 'drive' ? 'folder' : 'folder'; tab.label = entry.displayName; tab.entries = await load(entry.path); tab.selected = stored[entry.path]?.name ? tab.entries.find((child) => child.name === stored[entry.path].name)?.id || null : null; saveSession(); render(); } else { try { await openPath(entry.path); } catch (error) { console.error('openPath failed', entry.path, error); } }
+  const tab = currentTab(state.panes[paneIndex]); remember(tab.path, entry.name);
+  if (entry.kind === 'drive' || entry.kind === 'folder') { await navigateTabTo(paneIndex, entry.path); } else { try { await openPath(entry.path); } catch (error) { console.error('openPath failed', entry.path, error); } }
 }
 
-async function goUp(index) { const pane = state.panes[index]; const tab = currentTab(pane); if (!tab || !tab.path) return; const trimmed = tab.path.replace(/[\\/]+$/, ''); let parent = /^[A-Za-z]:$/.test(trimmed) || trimmed === '' ? '' : trimmed.replace(/[\\/][^\\/]+$/, '') || ''; if (/^[A-Za-z]:$/.test(parent)) parent += '\\'; if (!parent) { tab.path = ''; tab.kind = 'drives'; tab.label = 'This PC'; tab.entries = await loadDrives(); } else { tab.path = parent; tab.kind = 'folder'; tab.label = parent.split(/[\\/]/).filter(Boolean).pop() || parent; tab.entries = await load(parent); } tab.selected = null; saveSession(); render(); }
+async function goUp(index) { const tab = currentTab(state.panes[index]); if (!tab || !tab.path) return; const trimmed = tab.path.replace(/[\\/]+$/, ''); let parent = /^[A-Za-z]:$/.test(trimmed) || trimmed === '' ? '' : trimmed.replace(/[\\/][^\\/]+$/, '') || ''; if (/^[A-Za-z]:$/.test(parent)) parent += '\\'; await navigateTabTo(index, parent); }
 
 function moveSelection(index, direction) { const pane = state.panes[index]; const tab = currentTab(pane); const entries = tab?.entries || []; if (!entries.length) return; const current = entries.findIndex((entry) => entry.id === tab.selected); const next = current < 0 ? (direction > 0 ? 0 : entries.length - 1) : Math.max(0, Math.min(entries.length - 1, current + direction)); tab.selected = entries[next].id; if (tab.path) remember(tab.path, entries[next].name); saveSession(); render(); }
 
@@ -344,7 +372,7 @@ function bindEvents() {
       });
     });
     element.querySelectorAll('[data-tab]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); state.activePane = index; pane.activeTab = Number(button.dataset.tab); saveSession(); render(); }));
-    element.querySelector('[data-new-tab]').addEventListener('click', async (event) => { event.stopPropagation(); const current = currentTab(pane); const path = current?.path || ''; pane.tabs.push(path ? { path, kind: 'folder', label: path.split(/[\\/]/).pop(), entries: await load(path), selected: null } : { path: '', kind: 'drives', label: 'This PC', entries: await loadDrives(), selected: null }); pane.activeTab = pane.tabs.length - 1; saveSession(); render(); });
+    element.querySelector('[data-new-tab]').addEventListener('click', async (event) => { event.stopPropagation(); const current = currentTab(pane); const path = current?.path || ''; pane.tabs.push(path ? { path, kind: 'folder', label: path.split(/[\\/]/).pop(), entries: await load(path), selected: null, history: [path], historyIndex: 0 } : { path: '', kind: 'drives', label: 'This PC', entries: await loadDrives(), selected: null, history: [''], historyIndex: 0 }); pane.activeTab = pane.tabs.length - 1; saveSession(); render(); });
     element.querySelector('[data-up]').addEventListener('click', (event) => { event.stopPropagation(); goUp(index); });
     element.querySelectorAll('[data-breadcrumb]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); navigateToPath(index, button.dataset.breadcrumb); }));
     const viewSelectEl = element.querySelector('[data-view-select]');
@@ -375,6 +403,8 @@ function bindEvents() {
       });
     });
   });
+  document.querySelector('[data-go-back]')?.addEventListener('click', () => goBack(state.activePane));
+  document.querySelector('[data-go-forward]')?.addEventListener('click', () => goForward(state.activePane));
   document.querySelector('#hidden-toggle').addEventListener('change', async (event) => { state.showHidden = event.currentTarget.checked; await Promise.all(state.panes.flatMap((pane) => pane.tabs.filter((tab) => tab.path).map(async (tab) => { tab.entries = await load(tab.path); }))); render(); });
   document.querySelector('#location-input').addEventListener('keydown', (event) => { if (event.key !== 'Enter') return; event.preventDefault(); const input = event.currentTarget; navigatePath(input.value).catch(() => input.select()); });
   const renameInput = document.querySelector('[data-rename]'); renameInput?.addEventListener('click', (event) => event.stopPropagation()); renameInput?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelRename(); } if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); } }); renameInput?.addEventListener('blur', (event) => { const entry = currentTab(state.panes[state.activePane]).entries.find((item) => item.id === state.editing?.entryId); if (entry) finishRename(state.activePane, entry, event.currentTarget.value).catch(() => cancelRename()); });
@@ -395,6 +425,8 @@ document.addEventListener('keydown', (event) => {
   const isTyping = event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA';
   const pane = state.panes[state.activePane]; const tab = currentTab(pane);
   if (event.key === 'Delete' && !isTyping) { event.preventDefault(); deleteSelected(state.activePane); return; }
+  if (event.altKey && event.key === 'ArrowLeft') { event.preventDefault(); goBack(state.activePane); return; }
+  if (event.altKey && event.key === 'ArrowRight') { event.preventDefault(); goForward(state.activePane); return; }
   if (isTyping) return;
   if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveSelection(state.activePane, event.key === 'ArrowUp' ? -1 : 1); }
   if (event.key === 'Enter') { event.preventDefault(); enter(state.activePane, tab?.entries.find((entry) => entry.id === tab.selected)); }
@@ -412,7 +444,7 @@ async function start() {
   const savedPanes = Array.isArray(session.panes) ? session.panes : [];
   for (let index = 0; index < state.panes.length; index += 1) {
     const saved = savedPanes[index];
-    const tabs = saved?.tabs?.length ? await Promise.all(saved.tabs.map(async (item) => item.path ? { ...item, kind: 'folder', entries: await load(item.path) } : { path: '', kind: 'drives', label: 'This PC', entries: drives, selected: item.selected ?? null })) : [{ path: '', kind: 'drives', label: 'This PC', entries: drives, selected: null }];
+    const tabs = saved?.tabs?.length ? await Promise.all(saved.tabs.map(async (item) => item.path ? { ...item, kind: 'folder', entries: await load(item.path), history: [item.path], historyIndex: 0 } : { path: '', kind: 'drives', label: 'This PC', entries: drives, selected: item.selected ?? null, history: [''], historyIndex: 0 })) : [{ path: '', kind: 'drives', label: 'This PC', entries: drives, selected: null, history: [''], historyIndex: 0 }];
     state.panes[index] = { tabs, activeTab: Math.min(saved?.activeTab || 0, tabs.length - 1) };
   }
   render();
