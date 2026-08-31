@@ -15,6 +15,7 @@ const DOUBLE_CLICK_MS = 400;
 let lastEntryClick = { id: null, time: 0 };
 let entryClickTimer = null;
 let lastWatchedKey = '';
+let scrollSelectionIntoView = false;
 const fsChangeTimers = new Map();
 function normalizePath(path) { return path.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase(); }
 
@@ -87,8 +88,11 @@ function render() {
   const navHistory = `<button class="nav-history-button" data-go-back title="Back" aria-label="Go back" ${canGoBack ? '' : 'disabled'}>←</button><button class="nav-history-button" data-go-forward title="Forward" aria-label="Go forward" ${canGoForward ? '' : 'disabled'}>→</button><span class="toolbar-separator" aria-hidden="true"></span>`;
   document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin</span></footer>${renderContextMenu()}`;
   bindEvents();
-  const selectedRow = document.querySelector(`.pane[data-pane="${state.activePane}"] .file-row.selected, .pane[data-pane="${state.activePane}"] .thumb-card.selected`);
-  selectedRow?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  if (scrollSelectionIntoView) {
+    const selectedRow = document.querySelector(`.pane[data-pane="${state.activePane}"] .file-row.selected, .pane[data-pane="${state.activePane}"] .thumb-card.selected`);
+    selectedRow?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    scrollSelectionIntoView = false;
+  }
   syncWatchedPaths();
 }
 
@@ -302,7 +306,7 @@ async function goUp(index) {
   await navigateTabTo(index, parent);
 }
 
-function moveSelection(index, direction) { const pane = state.panes[index]; const tab = currentTab(pane); const entries = tab?.entries || []; if (!entries.length) return; const current = entries.findIndex((entry) => entry.id === tab.selected); const next = current < 0 ? (direction > 0 ? 0 : entries.length - 1) : Math.max(0, Math.min(entries.length - 1, current + direction)); tab.selected = entries[next].id; if (tab.path) remember(tab.path, entries[next].name); saveSession(); render(); }
+function moveSelection(index, direction) { const pane = state.panes[index]; const tab = currentTab(pane); const entries = tab?.entries || []; if (!entries.length) return; const current = entries.findIndex((entry) => entry.id === tab.selected); const next = current < 0 ? (direction > 0 ? 0 : entries.length - 1) : Math.max(0, Math.min(entries.length - 1, current + direction)); tab.selected = entries[next].id; if (tab.path) remember(tab.path, entries[next].name); saveSession(); scrollSelectionIntoView = true; render(); }
 
 function startTreeView(index) {
   const tab = currentTab(state.panes[index]);
@@ -375,6 +379,10 @@ function bindEvents() {
       // fallback for keyboard-triggered activation (Tab + Enter/Space), which never fires pointerdown.
       row.addEventListener('pointerdown', (event) => {
         if (event.button !== 0) return;
+        // Prevent the browser's default focus-on-mousedown behavior: focusing the button
+        // inside the scrollable list triggers a native scroll-into-view, which is what was
+        // causing the clicked row to jump to the bottom of the pane.
+        event.preventDefault();
         suppressNextClick = true;
         activate(event);
       });
