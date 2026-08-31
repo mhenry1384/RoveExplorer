@@ -11,7 +11,7 @@
   },
   "app": {
     "windows": [{ "title": "Rove", "width": 1240, "height": 800, "minWidth": 760, "minHeight": 560 }],
-    "security": { "csp": null }
+    "security": { "csp": null, "assetProtocol": { "enable": true, "scope": ["**"] } }
   },
   "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.ico"] }
 }
