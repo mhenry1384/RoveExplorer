@@ -198,11 +198,18 @@ async function navigateTabTo(index, path, { recordHistory = true, historyIndex }
   const pane = state.panes[index]; const tab = currentTab(pane);
   if (!tab) return;
   state.activePane = index;
+  const wasTreeView = tab.view === 'tree';
+  if (wasTreeView && tab.treeState?.requestId) invoke('cancel_tree_stats', { requestId: tab.treeState.requestId }).catch(() => {});
   const entries = path ? await load(path) : await loadDrives();
   tab.path = path; tab.kind = path ? 'folder' : 'drives'; tab.label = path ? (path.split(/[\\/]/).filter(Boolean).pop() || path) : COMPUTER_LABEL; tab.entries = entries;
   tab.selected = path && stored[path]?.name ? entries.find((entry) => entry.name === stored[path].name)?.id || null : null;
   if (recordHistory) pushHistory(tab, path); else if (historyIndex !== undefined) tab.historyIndex = historyIndex;
-  saveSession(); render();
+  saveSession();
+  if (wasTreeView) {
+    if (path) { tab.treeState = null; startTreeView(index); return; }
+    tab.view = 'details'; tab.treeState = null;
+  }
+  render();
 }
 
 function goBack(index) {
