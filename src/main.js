@@ -9,7 +9,7 @@ import { version as APP_VERSION } from '../package.json';
 const SEP = sep();
 const isWindows = SEP === '\\';
 const COMPUTER_LABEL = isWindows ? 'This PC' : 'This Mac';
-const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], contextMenu: null };
+const state = { panes: [{ tabs: [], activeTab: 0 }, { tabs: [], activeTab: 0 }], activePane: 0, showHidden: false, editing: null, folders: [], contextMenu: null, clipboard: null };
 const stored = JSON.parse(localStorage.getItem('rove-state') || '{}');
 const session = JSON.parse(localStorage.getItem('rove-session') || '{}');
 const DOUBLE_CLICK_MS = 400;
@@ -17,6 +17,9 @@ let lastEntryClick = { id: null, time: 0 };
 let entryClickTimer = null;
 let lastWatchedKey = '';
 let scrollSelectionIntoView = false;
+const TYPE_AHEAD_TIMEOUT_MS = 1000;
+let typeAheadBuffer = '';
+let typeAheadTime = 0;
 const fsChangeTimers = new Map();
 function normalizePath(path) { return path.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase(); }
 
@@ -89,7 +92,7 @@ function render() {
   const navHistory = `<button class="nav-history-button" data-go-back title="Back" aria-label="Go back" ${canGoBack ? '' : 'disabled'}>←</button><button class="nav-history-button" data-go-forward title="Forward" aria-label="Go forward" ${canGoForward ? '' : 'disabled'}>→</button><span class="toolbar-separator" aria-hidden="true"></span>`;
   const scrollPositions = new Map();
   document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); if (scrollable) scrollPositions.set(el.dataset.pane, scrollable.scrollTop); });
-  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><span class="version-tag">v${APP_VERSION}</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
+  document.querySelector('#app').innerHTML = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span>ROVE</span><span class="version-tag">v${APP_VERSION}</span><small>FILE EXPLORER</small></div><input class="location-input" id="location-input" value="${escapeAttribute(pathValue)}" placeholder="Enter a folder path" aria-label="Current folder path"><label class="hidden-toggle"><input type="checkbox" id="hidden-toggle" ${state.showHidden ? 'checked' : ''}><span>Show hidden</span></label></header><main class="workspace"><nav class="folder-toolbar" aria-label="Favorite folders">${navHistory}${toolbar}</nav><section class="panes" aria-label="File panes">${state.panes.map(renderPane).join('')}</section></main><footer class="footer"><span><kbd>Enter</kbd> open <kbd>Backspace</kbd> up a level <kbd>Delete</kbd> send to recycle bin <kbd>Ctrl</kbd>+<kbd>C</kbd>/<kbd>X</kbd>/<kbd>V</kbd> copy, cut, paste <kbd>Alt</kbd>+<kbd>←</kbd> back <kbd>Alt</kbd>+<kbd>→</kbd> forward</span></footer>${renderContextMenu()}`;
   bindEvents();
   document.querySelectorAll('.pane').forEach((el) => { const scrollable = el.querySelector('.table-wrap'); const saved = scrollPositions.get(el.dataset.pane); if (scrollable && saved) scrollable.scrollTop = saved; });
   if (scrollSelectionIntoView) {
@@ -128,8 +131,11 @@ function scheduleFolderReload(changedPath) {
 
 function renderContextMenu() {
   if (!state.contextMenu) return '';
-  const { x, y } = state.contextMenu;
-  return `<div class="context-menu" data-context-menu style="left:${x}px; top:${y}px"><button class="danger" data-context-delete>Delete</button></div>`;
+  const { x, y, kind } = state.contextMenu;
+  const items = kind === 'pane'
+    ? '<button data-context-paste>Paste</button>'
+    : `${kind === 'file' ? '<button data-context-copy>Copy</button><button data-context-cut>Cut</button>' : ''}<button class="danger" data-context-delete>Delete</button>`;
+  return `<div class="context-menu" data-context-menu style="left:${x}px; top:${y}px">${items}</div>`;
 }
 
 function renderTreeNode(node, depth, treeState, isRoot) {
@@ -156,6 +162,8 @@ function renderTreeBody(tab) {
   return '';
 }
 
+function isCutEntry(entry) { return !!(state.clipboard?.cut && state.clipboard.paths.includes(entry.path)); }
+
 function renderThumbnails(entries, selected, index) {
   if (!entries.length) return '<div class="empty-state"><span>⌁</span><strong>This folder is empty</strong><small>Choose another location to keep moving.</small></div>';
   const cards = entries.map((entry, entryIndex) => {
@@ -166,7 +174,7 @@ function renderThumbnails(entries, selected, index) {
     const label = editing
       ? `<input class="rename-input thumb-rename" data-rename value="${escapeAttribute(entry.name)}" aria-label="Rename">`
       : `<span class="thumb-name">${escapeAttribute(entry.displayName)}</span>`;
-    return `<button class="thumb-card ${selected === entry.id ? 'selected' : ''}" data-entry="${entry.id}" data-index="${entryIndex}"><div class="thumb-box">${thumb}</div>${label}</button>`;
+    return `<button class="thumb-card ${selected === entry.id ? 'selected' : ''} ${isCutEntry(entry) ? 'cut' : ''}" data-entry="${entry.id}" data-index="${entryIndex}"><div class="thumb-box">${thumb}</div>${label}</button>`;
   }).join('');
   return `<div class="thumb-grid">${cards}</div>`;
 }
@@ -175,7 +183,7 @@ function renderPane(pane, index) {
   const tab = currentTab(pane); const entries = tab?.entries || []; const selected = tab?.selected; const isDriveRoot = tab?.kind === 'drives';
   const view = tab?.view || 'details';
   const headers = isDriveRoot ? '<span>NAME</span><span>TOTAL SIZE</span><span>FREE SPACE</span><span>FILE SYSTEM</span>' : '<span>NAME</span><span>EXTENSION</span><span>SIZE</span><span>MODIFIED</span>';
-  const rows = entries.map((entry, entryIndex) => { const editing = isEditing(index, entry); const name = editing ? `<input class="rename-input" data-rename value="${escapeAttribute(entry.name)}" aria-label="Rename">` : `<strong>${entry.displayName}</strong>`; return `<button class="file-row ${isDriveRoot ? 'drive-row' : ''} ${selected === entry.id ? 'selected' : ''}" data-entry="${entry.id}" data-index="${entryIndex}"><span class="file-name">${renderFileIcon(entry)}${name}</span><span>${isDriveRoot ? entry.total : entry.extension}</span><span>${isDriveRoot ? entry.free : entry.size}</span><span>${isDriveRoot ? entry.fileSystem : (entry.modified === '—' ? '—' : new Date(Number(entry.modified) * 1000).toLocaleDateString('en', { month: 'short', day: 'numeric', year: 'numeric' }))}</span></button>`; }).join('') || '<div class="empty-state"><span>⌁</span><strong>This folder is empty</strong><small>Choose another location to keep moving.</small></div>';
+  const rows = entries.map((entry, entryIndex) => { const editing = isEditing(index, entry); const name = editing ? `<input class="rename-input" data-rename value="${escapeAttribute(entry.name)}" aria-label="Rename">` : `<strong>${entry.displayName}</strong>`; return `<button class="file-row ${isDriveRoot ? 'drive-row' : ''} ${selected === entry.id ? 'selected' : ''} ${isCutEntry(entry) ? 'cut' : ''}" data-entry="${entry.id}" data-index="${entryIndex}"><span class="file-name">${renderFileIcon(entry)}${name}</span><span>${isDriveRoot ? entry.total : entry.extension}</span><span>${isDriveRoot ? entry.free : entry.size}</span><span>${isDriveRoot ? entry.fileSystem : (entry.modified === '—' ? '—' : new Date(Number(entry.modified) * 1000).toLocaleDateString('en', { month: 'short', day: 'numeric', year: 'numeric' }))}</span></button>`; }).join('') || '<div class="empty-state"><span>⌁</span><strong>This folder is empty</strong><small>Choose another location to keep moving.</small></div>';
   const breadcrumb = tab?.path
     ? pathSegments(tab.path).map((segment, segIndex) => `${segIndex > 0 ? '<span class="path-sep">/</span>' : ''}<button class="path-segment" data-breadcrumb="${escapeAttribute(segment.path)}">${escapeAttribute(segment.label)}</button>`).join('')
     : `<span class="path-segment path-segment-static">${COMPUTER_LABEL}</span>`;
@@ -262,6 +270,82 @@ function deleteSelected(index) {
   if (tab?.view === 'tree') { if (tab.treeState?.selected) deleteTreeNode(index, tab.treeState.selected); return; }
   const entry = tab?.entries.find((item) => item.id === tab.selected);
   if (entry) deleteEntry(index, entry);
+}
+
+function selectedFileEntry(index) {
+  const tab = currentTab(state.panes[index]);
+  const entry = tab?.entries.find((item) => item.id === tab.selected);
+  return entry && entry.kind !== 'drive' ? entry : null;
+}
+
+async function copySelected(index) {
+  const entry = selectedFileEntry(index);
+  if (!entry) return;
+  await invoke('clipboard_write_paths', { paths: [entry.path], cut: false });
+  state.clipboard = { paths: [entry.path], cut: false };
+  state.contextMenu = null;
+  render();
+}
+
+async function cutSelected(index) {
+  const entry = selectedFileEntry(index);
+  if (!entry) return;
+  await invoke('clipboard_write_paths', { paths: [entry.path], cut: true });
+  state.clipboard = { paths: [entry.path], cut: true };
+  state.contextMenu = null;
+  render();
+}
+
+async function pasteIntoPane(index) {
+  const tab = currentTab(state.panes[index]);
+  state.contextMenu = null;
+  if (!tab?.path) { render(); return; }
+  let payload;
+  try { payload = await invoke('clipboard_read_paths'); } catch { render(); return; }
+  if (!payload?.paths.length) { render(); return; }
+  const pastedPaths = await invoke('paste_entries', { paths: payload.paths, destDir: tab.path, cut: payload.cut });
+  if (payload.cut) state.clipboard = null;
+  tab.entries = await load(tab.path);
+  const pastedName = pastedPaths[pastedPaths.length - 1]?.split(/[\\/]/).pop();
+  tab.selected = pastedName ? tab.entries.find((item) => item.name === pastedName)?.id || tab.selected : tab.selected;
+  saveSession();
+  scrollSelectionIntoView = true;
+  render();
+}
+
+function handleTypeAhead(index, char) {
+  const tab = currentTab(state.panes[index]);
+  const entries = tab?.entries;
+  if (!entries?.length || tab.view === 'tree') return;
+  const now = Date.now();
+  if (now - typeAheadTime > TYPE_AHEAD_TIMEOUT_MS) typeAheadBuffer = '';
+  typeAheadTime = now;
+  const nameOf = (entry) => (entry.displayName ?? entry.name ?? '').toLowerCase();
+  const findFrom = (term, startIndex) => {
+    for (let offset = 0; offset < entries.length; offset += 1) {
+      const idx = (startIndex + offset) % entries.length;
+      if (nameOf(entries[idx]).startsWith(term)) return idx;
+    }
+    return -1;
+  };
+  const currentIndex = entries.findIndex((entry) => entry.id === tab.selected);
+  const lowerChar = char.toLowerCase();
+  const isRepeatSingle = typeAheadBuffer.length > 0 && [...typeAheadBuffer].every((letter) => letter.toLowerCase() === lowerChar);
+  const query = (isRepeatSingle ? lowerChar : (typeAheadBuffer + char).toLowerCase());
+  let matchIndex = findFrom(query, currentIndex + 1);
+  if (matchIndex === -1 && query.length > 1) {
+    // Extending the search matched nothing: restart the buffer with just this new character.
+    matchIndex = findFrom(lowerChar, currentIndex + 1);
+    typeAheadBuffer = matchIndex === -1 ? '' : char;
+  } else {
+    typeAheadBuffer = matchIndex === -1 ? '' : typeAheadBuffer + char;
+  }
+  if (matchIndex === -1) return;
+  tab.selected = entries[matchIndex].id;
+  if (tab.path) remember(tab.path, entries[matchIndex].name);
+  saveSession();
+  scrollSelectionIntoView = true;
+  render();
 }
 
 function removeTreeNode(node, targetPath) {
@@ -365,6 +449,14 @@ function findTabByTreeRequest(requestId) {
 function bindEvents() {
   document.querySelectorAll('[data-folder-path]').forEach((button) => button.addEventListener('click', async () => { try { await navigatePath(await resolveFolderPath(button.dataset.folderPath)); } catch { button.classList.add('is-unavailable'); } }));
   document.querySelectorAll('.pane').forEach((element) => { const index = Number(element.dataset.pane); const pane = state.panes[index]; element.addEventListener('click', () => { state.activePane = index; render(); });
+    element.addEventListener('contextmenu', (event) => {
+      if (event.target.closest('[data-entry]') || event.target.closest('[data-tree-node]')) return;
+      event.preventDefault();
+      if (state.editing) return;
+      state.activePane = index;
+      state.contextMenu = { pane: index, kind: 'pane', x: event.clientX, y: event.clientY };
+      render();
+    });
     element.querySelectorAll('[data-entry]').forEach((row) => {
       let suppressNextClick = false;
       const activate = (event) => {
@@ -461,19 +553,27 @@ function bindEvents() {
     const entry = currentTab(state.panes[menu.pane]).entries.find((item) => item.id === menu.entryId);
     deleteEntry(menu.pane, entry);
   });
+  document.querySelector('[data-context-copy]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) copySelected(menu.pane); });
+  document.querySelector('[data-context-cut]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) cutSelected(menu.pane); });
+  document.querySelector('[data-context-paste]')?.addEventListener('click', () => { const menu = state.contextMenu; if (menu) pasteIntoPane(menu.pane); });
 }
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && state.contextMenu) { state.contextMenu = null; render(); return; }
   const isTyping = event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA';
   const pane = state.panes[state.activePane]; const tab = currentTab(pane);
+  const isClipboardCombo = (event.ctrlKey || event.metaKey) && !event.altKey;
+  if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'c') { event.preventDefault(); copySelected(state.activePane); return; }
+  if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'x') { event.preventDefault(); cutSelected(state.activePane); return; }
+  if (!isTyping && isClipboardCombo && event.key.toLowerCase() === 'v') { event.preventDefault(); pasteIntoPane(state.activePane); return; }
   if (event.key === 'Delete' && !isTyping) { event.preventDefault(); deleteSelected(state.activePane); return; }
   if (event.altKey && event.key === 'ArrowLeft') { event.preventDefault(); goBack(state.activePane); return; }
   if (event.altKey && event.key === 'ArrowRight') { event.preventDefault(); goForward(state.activePane); return; }
   if (isTyping) return;
-  if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveSelection(state.activePane, event.key === 'ArrowUp' ? -1 : 1); }
-  if (event.key === 'Enter') { event.preventDefault(); enter(state.activePane, tab?.entries.find((entry) => entry.id === tab.selected)); }
-  if (event.key === 'Backspace') { event.preventDefault(); goUp(state.activePane); }
+  if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveSelection(state.activePane, event.key === 'ArrowUp' ? -1 : 1); return; }
+  if (event.key === 'Enter') { event.preventDefault(); enter(state.activePane, tab?.entries.find((entry) => entry.id === tab.selected)); return; }
+  if (event.key === 'Backspace') { event.preventDefault(); goUp(state.activePane); return; }
+  if (!state.contextMenu && !event.ctrlKey && !event.altKey && !event.metaKey && event.key.length === 1) { event.preventDefault(); handleTypeAhead(state.activePane, event.key); }
 });
 document.addEventListener('click', (event) => {
   if (!state.contextMenu || event.target.closest('.context-menu')) return;

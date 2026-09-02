@@ -24,6 +24,18 @@ struct IconCacheState {
     cache: Mutex<HashMap<String, Option<String>>>,
 }
 
+#[cfg(not(windows))]
+#[derive(Default)]
+struct ClipboardState {
+    files: Mutex<Option<(Vec<String>, bool)>>,
+}
+
+#[derive(Serialize)]
+struct ClipboardFiles {
+    paths: Vec<String>,
+    cut: bool,
+}
+
 #[derive(Serialize)]
 struct Entry {
     kind: String,
@@ -167,6 +179,350 @@ fn rename_entry(path: String, new_name: String) -> Result<(), String> {
 #[tauri::command]
 fn delete_entry(path: String) -> Result<(), String> {
     trash::delete(&path).map_err(|error| error.to_string())
+}
+
+// Copies the OS clipboard's file-list format (CF_HDROP) plus the "Preferred DropEffect" format
+// that Explorer uses to mark a copy vs. a cut, so cutting/copying here is interchangeable with
+// Explorer: paths copied in Rove can be pasted in Explorer and vice versa.
+#[cfg(windows)]
+mod win_clipboard {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::Mutex;
+
+    const CF_HDROP: u32 = 15;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    const GMEM_ZEROINIT: u32 = 0x0040;
+    static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
+
+    #[repr(C)]
+    struct DropFiles {
+        p_files: u32,
+        pt_x: i32,
+        pt_y: i32,
+        f_nc: i32,
+        f_wide: i32,
+    }
+
+    extern "system" {
+        fn OpenClipboard(owner: isize) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn GetClipboardData(format: u32) -> isize;
+        fn SetClipboardData(format: u32, data: isize) -> isize;
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
+        fn GlobalAlloc(flags: u32, bytes: usize) -> isize;
+        fn GlobalLock(mem: isize) -> *mut u8;
+        fn GlobalUnlock(mem: isize) -> i32;
+        fn GlobalFree(mem: isize) -> isize;
+        fn DragQueryFileW(hdrop: isize, index: u32, buffer: *mut u16, buffer_len: u32) -> u32;
+    }
+
+    fn drop_effect_format() -> u32 {
+        let name: Vec<u16> = OsStr::new("Preferred DropEffect").encode_wide().chain(Some(0)).collect();
+        unsafe { RegisterClipboardFormatW(name.as_ptr()) }
+    }
+
+    pub fn write_paths(paths: &[String], cut: bool) -> Result<(), String> {
+        let _guard = CLIPBOARD_LOCK.lock().map_err(|_| "clipboard lock poisoned".to_string())?;
+        unsafe {
+            if OpenClipboard(0) == 0 {
+                return Err("Could not open the clipboard".to_string());
+            }
+            if EmptyClipboard() == 0 {
+                CloseClipboard();
+                return Err("Could not clear the clipboard".to_string());
+            }
+
+            let mut wide_list: Vec<u16> = Vec::new();
+            for path in paths {
+                wide_list.extend(OsStr::new(path).encode_wide());
+                wide_list.push(0);
+            }
+            wide_list.push(0);
+            let header_size = std::mem::size_of::<DropFiles>();
+            let data_bytes = wide_list.len() * 2;
+            let hmem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, header_size + data_bytes);
+            if hmem == 0 {
+                CloseClipboard();
+                return Err("Out of memory copying paths".to_string());
+            }
+            let ptr = GlobalLock(hmem);
+            if ptr.is_null() {
+                GlobalFree(hmem);
+                CloseClipboard();
+                return Err("Could not lock clipboard memory".to_string());
+            }
+            let header = DropFiles { p_files: header_size as u32, pt_x: 0, pt_y: 0, f_nc: 0, f_wide: 1 };
+            std::ptr::copy_nonoverlapping(&header as *const DropFiles as *const u8, ptr, header_size);
+            std::ptr::copy_nonoverlapping(wide_list.as_ptr() as *const u8, ptr.add(header_size), data_bytes);
+            GlobalUnlock(hmem);
+            if SetClipboardData(CF_HDROP, hmem) == 0 {
+                GlobalFree(hmem);
+                CloseClipboard();
+                return Err("Could not set clipboard data".to_string());
+            }
+
+            let format_id = drop_effect_format();
+            if format_id != 0 {
+                let hmem_effect = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, 4);
+                if hmem_effect != 0 {
+                    let ptr_effect = GlobalLock(hmem_effect);
+                    if !ptr_effect.is_null() {
+                        let effect: u32 = if cut { 2 } else { 1 };
+                        std::ptr::copy_nonoverlapping(&effect as *const u32 as *const u8, ptr_effect, 4);
+                        GlobalUnlock(hmem_effect);
+                        if SetClipboardData(format_id, hmem_effect) == 0 {
+                            GlobalFree(hmem_effect);
+                        }
+                    } else {
+                        GlobalFree(hmem_effect);
+                    }
+                }
+            }
+
+            CloseClipboard();
+        }
+        Ok(())
+    }
+
+    pub fn read_paths() -> Result<Option<(Vec<String>, bool)>, String> {
+        let _guard = CLIPBOARD_LOCK.lock().map_err(|_| "clipboard lock poisoned".to_string())?;
+        unsafe {
+            if OpenClipboard(0) == 0 {
+                return Err("Could not open the clipboard".to_string());
+            }
+            if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+                CloseClipboard();
+                return Ok(None);
+            }
+            let hdrop = GetClipboardData(CF_HDROP);
+            if hdrop == 0 {
+                CloseClipboard();
+                return Ok(None);
+            }
+            let count = DragQueryFileW(hdrop, 0xFFFFFFFF, std::ptr::null_mut(), 0);
+            let mut paths = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let needed = DragQueryFileW(hdrop, index, std::ptr::null_mut(), 0);
+                let mut buffer = vec![0u16; (needed + 1) as usize];
+                let written = DragQueryFileW(hdrop, index, buffer.as_mut_ptr(), buffer.len() as u32);
+                buffer.truncate(written as usize);
+                paths.push(String::from_utf16_lossy(&buffer));
+            }
+
+            let mut cut = false;
+            let format_id = drop_effect_format();
+            if format_id != 0 && IsClipboardFormatAvailable(format_id) != 0 {
+                let hmem_effect = GetClipboardData(format_id);
+                if hmem_effect != 0 {
+                    let ptr_effect = GlobalLock(hmem_effect);
+                    if !ptr_effect.is_null() {
+                        let mut effect: u32 = 0;
+                        std::ptr::copy_nonoverlapping(ptr_effect, &mut effect as *mut u32 as *mut u8, 4);
+                        GlobalUnlock(hmem_effect);
+                        cut = effect == 2;
+                    }
+                }
+            }
+
+            CloseClipboard();
+            Ok(Some((paths, cut)))
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod win_clipboard_tests {
+    use super::win_clipboard;
+
+    #[test]
+    fn roundtrips_our_own_write() {
+        let paths = vec!["C:\\Windows\\notepad.exe".to_string(), "C:\\Windows\\explorer.exe".to_string()];
+        win_clipboard::write_paths(&paths, true).expect("write_paths failed");
+        let (read_back, cut) = win_clipboard::read_paths().expect("read_paths failed").expect("expected clipboard files");
+        assert_eq!(read_back, paths);
+        assert!(cut);
+
+        win_clipboard::write_paths(&paths, false).expect("write_paths failed");
+        let (_, cut) = win_clipboard::read_paths().expect("read_paths failed").expect("expected clipboard files");
+        assert!(!cut);
+    }
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn clipboard_write_paths(paths: Vec<String>, cut: bool) -> Result<(), String> {
+    win_clipboard::write_paths(&paths, cut)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn clipboard_read_paths() -> Result<Option<ClipboardFiles>, String> {
+    Ok(win_clipboard::read_paths()?.map(|(paths, cut)| ClipboardFiles { paths, cut }))
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn clipboard_write_paths(state: State<ClipboardState>, paths: Vec<String>, cut: bool) -> Result<(), String> {
+    *state.files.lock().map_err(|_| "clipboard lock poisoned".to_string())? = Some((paths, cut));
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn clipboard_read_paths(state: State<ClipboardState>) -> Result<Option<ClipboardFiles>, String> {
+    let files = state.files.lock().map_err(|_| "clipboard lock poisoned".to_string())?;
+    Ok(files.clone().map(|(paths, cut)| ClipboardFiles { paths, cut }))
+}
+
+fn copy_dir_recursive(source: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+// Mirrors Explorer's conflict handling: never overwrite silently, instead find the next free
+// "name - Copy" / "name - Copy (n)" name, which is also what a copy-paste into the same folder
+// needs since the source itself already occupies the plain name.
+fn unique_destination(dest_dir: &Path, name: &str) -> std::path::PathBuf {
+    let candidate = dest_dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = Path::new(name).file_stem().map(|value| value.to_string_lossy().to_string()).unwrap_or_else(|| name.to_string());
+    let extension = Path::new(name).extension().map(|value| format!(".{}", value.to_string_lossy())).unwrap_or_default();
+    let mut attempt = 1u32;
+    loop {
+        let candidate_name = if attempt == 1 { format!("{stem} - Copy{extension}") } else { format!("{stem} - Copy ({attempt}){extension}") };
+        let candidate = dest_dir.join(&candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+#[tauri::command]
+fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool) -> Result<Vec<String>, String> {
+    let dest = Path::new(&dest_dir);
+    let mut results = Vec::with_capacity(paths.len());
+    for source_path in paths {
+        let source = Path::new(&source_path);
+        let Some(name) = source.file_name().map(|value| value.to_string_lossy().to_string()) else { continue };
+        if cut && source.parent() == Some(dest) {
+            // Cutting and pasting back into the same folder is a no-op, like Explorer.
+            results.push(source_path);
+            continue;
+        }
+        let target = unique_destination(dest, &name);
+        if cut {
+            if fs::rename(source, &target).is_err() {
+                if source.is_dir() {
+                    copy_dir_recursive(source, &target).map_err(|error| error.to_string())?;
+                    fs::remove_dir_all(source).map_err(|error| error.to_string())?;
+                } else {
+                    fs::copy(source, &target).map_err(|error| error.to_string())?;
+                    fs::remove_file(source).map_err(|error| error.to_string())?;
+                }
+            }
+        } else if source.is_dir() {
+            copy_dir_recursive(source, &target).map_err(|error| error.to_string())?;
+        } else {
+            fs::copy(source, &target).map_err(|error| error.to_string())?;
+        }
+        results.push(target.to_string_lossy().to_string());
+    }
+    Ok(results)
+}
+
+#[cfg(test)]
+mod paste_entries_tests {
+    use super::*;
+
+    struct Sandbox {
+        dir: std::path::PathBuf,
+    }
+
+    impl Sandbox {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("rove-test-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Sandbox { dir }
+        }
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn unique_destination_avoids_existing_names() {
+        let sandbox = Sandbox::new("unique-dest");
+        fs::write(sandbox.path("a.txt"), b"one").unwrap();
+        assert_eq!(unique_destination(&sandbox.dir, "b.txt"), sandbox.path("b.txt"));
+        assert_eq!(unique_destination(&sandbox.dir, "a.txt"), sandbox.path("a - Copy.txt"));
+        fs::write(sandbox.path("a - Copy.txt"), b"two").unwrap();
+        assert_eq!(unique_destination(&sandbox.dir, "a.txt"), sandbox.path("a - Copy (2).txt"));
+    }
+
+    #[test]
+    fn copy_paste_duplicates_into_new_name_in_same_folder() {
+        let sandbox = Sandbox::new("copy-same-folder");
+        fs::write(sandbox.path("a.txt"), b"hello").unwrap();
+        let result = paste_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), false).unwrap();
+        assert_eq!(result, vec![sandbox.path("a - Copy.txt").to_string_lossy().to_string()]);
+        assert!(sandbox.path("a.txt").exists());
+        assert_eq!(fs::read_to_string(sandbox.path("a - Copy.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn cut_paste_into_same_folder_is_a_no_op() {
+        let sandbox = Sandbox::new("cut-same-folder");
+        fs::write(sandbox.path("a.txt"), b"hello").unwrap();
+        let result = paste_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), true).unwrap();
+        assert_eq!(result, vec![sandbox.path("a.txt").to_string_lossy().to_string()]);
+        assert!(sandbox.path("a.txt").exists());
+    }
+
+    #[test]
+    fn cut_paste_moves_into_a_different_folder() {
+        let source_sandbox = Sandbox::new("cut-source");
+        let dest_sandbox = Sandbox::new("cut-dest");
+        fs::write(source_sandbox.path("a.txt"), b"hello").unwrap();
+        let result = paste_entries(vec![source_sandbox.path("a.txt").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), true).unwrap();
+        assert_eq!(result, vec![dest_sandbox.path("a.txt").to_string_lossy().to_string()]);
+        assert!(!source_sandbox.path("a.txt").exists());
+        assert_eq!(fs::read_to_string(dest_sandbox.path("a.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn copy_paste_directory_recurses() {
+        let source_sandbox = Sandbox::new("copy-dir-source");
+        let dest_sandbox = Sandbox::new("copy-dir-dest");
+        fs::create_dir_all(source_sandbox.path("folder/nested")).unwrap();
+        fs::write(source_sandbox.path("folder/file.txt"), b"top").unwrap();
+        fs::write(source_sandbox.path("folder/nested/inner.txt"), b"deep").unwrap();
+        paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false).unwrap();
+        assert_eq!(fs::read_to_string(dest_sandbox.path("folder/file.txt")).unwrap(), "top");
+        assert_eq!(fs::read_to_string(dest_sandbox.path("folder/nested/inner.txt")).unwrap(), "deep");
+        assert!(source_sandbox.path("folder").exists());
+    }
 }
 
 #[tauri::command]
@@ -496,13 +852,16 @@ fn get_extension_icon(_state: State<IconCacheState>, _extension: String) -> Opti
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(WatcherState::default())
         .manage(TreeState::default())
-        .manage(IconCacheState::default())
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon])
+        .manage(IconCacheState::default());
+    #[cfg(not(windows))]
+    let builder = builder.manage(ClipboardState::default());
+    builder
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove");
 }

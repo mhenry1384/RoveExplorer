@@ -26,6 +26,8 @@ html, body, #app { height: 100%; overflow: hidden; }
 .quick-folder.is-unavailable { opacity: .45; }
 @media (max-width: 700px) { .folder-toolbar { margin-bottom: 8px; } }
 
+.file-row.cut, .thumb-card.cut { opacity: .5; }
+
 .context-menu { position: fixed; z-index: 100; min-width: 150px; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 10px 30px rgba(36,38,35,.18); padding: 4px; }
 .context-menu button { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 8px 12px; font: 11px 'DM Mono'; color: var(--ink); }
 .context-menu button:hover { background: #f2f4e5; }
