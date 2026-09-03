@@ -412,8 +412,81 @@ fn unique_destination(dest_dir: &Path, name: &str) -> std::path::PathBuf {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ConflictResolution {
+    Replace,
+    Skip,
+}
+
+// When a pasted folder merges into an existing same-named folder, only files that already exist
+// at the corresponding destination path are a real conflict - everything else just lands
+// alongside the existing content, the same way Explorer merges two folders.
+fn plan_merge_conflicts(source: &Path, dest: &Path, conflicts: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = fs::read_dir(source) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let entry_path = entry.path();
+        let target = dest.join(entry.file_name());
+        let is_dir = entry.file_type().map(|value| value.is_dir()).unwrap_or(false);
+        if is_dir {
+            if target.is_dir() {
+                plan_merge_conflicts(&entry_path, &target, conflicts);
+            }
+        } else if target.exists() {
+            conflicts.push(target);
+        }
+    }
+}
+
 #[tauri::command]
-fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool) -> Result<Vec<String>, String> {
+fn scan_paste_conflicts(paths: Vec<String>, dest_dir: String) -> Result<Vec<String>, String> {
+    let dest = Path::new(&dest_dir);
+    let mut conflicts = Vec::new();
+    for source_path in &paths {
+        let source = Path::new(source_path);
+        let Some(name) = source.file_name() else { continue };
+        let target = dest.join(name);
+        if source.is_dir() && target.is_dir() {
+            plan_merge_conflicts(source, &target, &mut conflicts);
+        }
+    }
+    Ok(conflicts.into_iter().map(|path| path.to_string_lossy().to_string()).collect())
+}
+
+// Merges `source`'s contents into the already-existing `dest` folder. A conflicting file is
+// replaced or left alone per `resolution`; for a cut, a file is only removed from `source` once
+// it has actually landed in `dest`, so a skipped file simply stays behind instead of being lost,
+// and a folder is only pruned once it has been fully drained by removing an (expectedly) empty dir.
+fn merge_dir_recursive(source: &Path, dest: &Path, cut: bool, resolution: ConflictResolution) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let target = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            merge_dir_recursive(&entry_path, &target, cut, resolution)?;
+            if cut {
+                let _ = fs::remove_dir(&entry_path);
+            }
+        } else if target.exists() {
+            if resolution == ConflictResolution::Replace {
+                fs::copy(&entry_path, &target)?;
+                if cut {
+                    fs::remove_file(&entry_path)?;
+                }
+            }
+        } else {
+            fs::copy(&entry_path, &target)?;
+            if cut {
+                fs::remove_file(&entry_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool, conflict_resolution: Option<String>) -> Result<Vec<String>, String> {
+    let resolution = if conflict_resolution.as_deref() == Some("replace") { ConflictResolution::Replace } else { ConflictResolution::Skip };
     let dest = Path::new(&dest_dir);
     let mut results = Vec::with_capacity(paths.len());
     for source_path in paths {
@@ -422,6 +495,16 @@ fn paste_entries(paths: Vec<String>, dest_dir: String, cut: bool) -> Result<Vec<
         if cut && source.parent() == Some(dest) {
             // Cutting and pasting back into the same folder is a no-op, like Explorer.
             results.push(source_path);
+            continue;
+        }
+        let existing_target = dest.join(&name);
+        if source.is_dir() && existing_target.is_dir() {
+            // A same-named folder already lives here: merge into it instead of renaming a copy alongside it.
+            merge_dir_recursive(source, &existing_target, cut, resolution).map_err(|error| error.to_string())?;
+            if cut {
+                let _ = fs::remove_dir(source);
+            }
+            results.push(existing_target.to_string_lossy().to_string());
             continue;
         }
         let target = unique_destination(dest, &name);
@@ -485,7 +568,7 @@ mod paste_entries_tests {
     fn copy_paste_duplicates_into_new_name_in_same_folder() {
         let sandbox = Sandbox::new("copy-same-folder");
         fs::write(sandbox.path("a.txt"), b"hello").unwrap();
-        let result = paste_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), false).unwrap();
+        let result = paste_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), false, None).unwrap();
         assert_eq!(result, vec![sandbox.path("a - Copy.txt").to_string_lossy().to_string()]);
         assert!(sandbox.path("a.txt").exists());
         assert_eq!(fs::read_to_string(sandbox.path("a - Copy.txt")).unwrap(), "hello");
@@ -495,7 +578,7 @@ mod paste_entries_tests {
     fn cut_paste_into_same_folder_is_a_no_op() {
         let sandbox = Sandbox::new("cut-same-folder");
         fs::write(sandbox.path("a.txt"), b"hello").unwrap();
-        let result = paste_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), true).unwrap();
+        let result = paste_entries(vec![sandbox.path("a.txt").to_string_lossy().to_string()], sandbox.dir.to_string_lossy().to_string(), true, None).unwrap();
         assert_eq!(result, vec![sandbox.path("a.txt").to_string_lossy().to_string()]);
         assert!(sandbox.path("a.txt").exists());
     }
@@ -505,7 +588,7 @@ mod paste_entries_tests {
         let source_sandbox = Sandbox::new("cut-source");
         let dest_sandbox = Sandbox::new("cut-dest");
         fs::write(source_sandbox.path("a.txt"), b"hello").unwrap();
-        let result = paste_entries(vec![source_sandbox.path("a.txt").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), true).unwrap();
+        let result = paste_entries(vec![source_sandbox.path("a.txt").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), true, None).unwrap();
         assert_eq!(result, vec![dest_sandbox.path("a.txt").to_string_lossy().to_string()]);
         assert!(!source_sandbox.path("a.txt").exists());
         assert_eq!(fs::read_to_string(dest_sandbox.path("a.txt")).unwrap(), "hello");
@@ -518,10 +601,94 @@ mod paste_entries_tests {
         fs::create_dir_all(source_sandbox.path("folder/nested")).unwrap();
         fs::write(source_sandbox.path("folder/file.txt"), b"top").unwrap();
         fs::write(source_sandbox.path("folder/nested/inner.txt"), b"deep").unwrap();
-        paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false).unwrap();
+        paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, None).unwrap();
         assert_eq!(fs::read_to_string(dest_sandbox.path("folder/file.txt")).unwrap(), "top");
         assert_eq!(fs::read_to_string(dest_sandbox.path("folder/nested/inner.txt")).unwrap(), "deep");
         assert!(source_sandbox.path("folder").exists());
+    }
+
+    #[test]
+    fn scan_finds_conflicts_only_for_files_that_already_exist_in_the_destination() {
+        let source_sandbox = Sandbox::new("scan-source");
+        let dest_sandbox = Sandbox::new("scan-dest");
+        fs::create_dir_all(source_sandbox.path("folder/nested")).unwrap();
+        fs::write(source_sandbox.path("folder/new.txt"), b"new").unwrap();
+        fs::write(source_sandbox.path("folder/clash.txt"), b"source version").unwrap();
+        fs::write(source_sandbox.path("folder/nested/deep-clash.txt"), b"source deep").unwrap();
+        fs::create_dir_all(dest_sandbox.path("folder/nested")).unwrap();
+        fs::write(dest_sandbox.path("folder/clash.txt"), b"dest version").unwrap();
+        fs::write(dest_sandbox.path("folder/nested/deep-clash.txt"), b"dest deep").unwrap();
+
+        let conflicts = scan_paste_conflicts(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string()).unwrap();
+        let mut conflicts: Vec<_> = conflicts.into_iter().collect();
+        conflicts.sort();
+        let mut expected = vec![dest_sandbox.dir.join("folder").join("clash.txt").to_string_lossy().to_string(), dest_sandbox.dir.join("folder").join("nested").join("deep-clash.txt").to_string_lossy().to_string()];
+        expected.sort();
+        assert_eq!(conflicts, expected);
+    }
+
+    #[test]
+    fn scan_reports_no_conflicts_when_folder_is_new() {
+        let source_sandbox = Sandbox::new("scan-new-source");
+        let dest_sandbox = Sandbox::new("scan-new-dest");
+        fs::create_dir_all(source_sandbox.path("folder")).unwrap();
+        fs::write(source_sandbox.path("folder/a.txt"), b"a").unwrap();
+        let conflicts = scan_paste_conflicts(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string()).unwrap();
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn copy_paste_merges_into_existing_folder_of_the_same_name_and_skips_by_default() {
+        let source_sandbox = Sandbox::new("merge-copy-source");
+        let dest_sandbox = Sandbox::new("merge-copy-dest");
+        fs::create_dir_all(source_sandbox.path("folder")).unwrap();
+        fs::write(source_sandbox.path("folder/new.txt"), b"new").unwrap();
+        fs::write(source_sandbox.path("folder/clash.txt"), b"source version").unwrap();
+        fs::create_dir_all(dest_sandbox.path("folder")).unwrap();
+        fs::write(dest_sandbox.path("folder/existing.txt"), b"existing").unwrap();
+        fs::write(dest_sandbox.path("folder/clash.txt"), b"dest version").unwrap();
+
+        let result = paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, Some("skip".to_string())).unwrap();
+        assert_eq!(result, vec![dest_sandbox.path("folder").to_string_lossy().to_string()]);
+        // Merged: both the pre-existing and the newly copied file are present.
+        assert_eq!(fs::read_to_string(dest_sandbox.path("folder/existing.txt")).unwrap(), "existing");
+        assert_eq!(fs::read_to_string(dest_sandbox.path("folder/new.txt")).unwrap(), "new");
+        // Skip: the conflicting file keeps the destination's content.
+        assert_eq!(fs::read_to_string(dest_sandbox.path("folder/clash.txt")).unwrap(), "dest version");
+        // Copy (not cut): source is untouched either way.
+        assert_eq!(fs::read_to_string(source_sandbox.path("folder/clash.txt")).unwrap(), "source version");
+    }
+
+    #[test]
+    fn copy_paste_merge_replaces_conflicts_when_asked() {
+        let source_sandbox = Sandbox::new("merge-replace-source");
+        let dest_sandbox = Sandbox::new("merge-replace-dest");
+        fs::create_dir_all(source_sandbox.path("folder")).unwrap();
+        fs::write(source_sandbox.path("folder/clash.txt"), b"source version").unwrap();
+        fs::create_dir_all(dest_sandbox.path("folder")).unwrap();
+        fs::write(dest_sandbox.path("folder/clash.txt"), b"dest version").unwrap();
+
+        paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), false, Some("replace".to_string())).unwrap();
+        assert_eq!(fs::read_to_string(dest_sandbox.path("folder/clash.txt")).unwrap(), "source version");
+    }
+
+    #[test]
+    fn cut_paste_merge_moves_non_conflicting_files_and_leaves_skipped_ones_behind() {
+        let source_sandbox = Sandbox::new("merge-cut-source");
+        let dest_sandbox = Sandbox::new("merge-cut-dest");
+        fs::create_dir_all(source_sandbox.path("folder")).unwrap();
+        fs::write(source_sandbox.path("folder/moved.txt"), b"moved").unwrap();
+        fs::write(source_sandbox.path("folder/clash.txt"), b"source version").unwrap();
+        fs::create_dir_all(dest_sandbox.path("folder")).unwrap();
+        fs::write(dest_sandbox.path("folder/clash.txt"), b"dest version").unwrap();
+
+        paste_entries(vec![source_sandbox.path("folder").to_string_lossy().to_string()], dest_sandbox.dir.to_string_lossy().to_string(), true, Some("skip".to_string())).unwrap();
+        // Non-conflicting file was moved out of the source.
+        assert!(!source_sandbox.path("folder/moved.txt").exists());
+        assert_eq!(fs::read_to_string(dest_sandbox.path("folder/moved.txt")).unwrap(), "moved");
+        // Skipped conflicting file stays behind in the source rather than being lost.
+        assert_eq!(fs::read_to_string(source_sandbox.path("folder/clash.txt")).unwrap(), "source version");
+        assert_eq!(fs::read_to_string(dest_sandbox.path("folder/clash.txt")).unwrap(), "dest version");
     }
 }
 
@@ -861,7 +1028,7 @@ pub fn run() {
     #[cfg(not(windows))]
     let builder = builder.manage(ClipboardState::default());
     builder
-        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, paste_entries])
+        .invoke_handler(tauri::generate_handler![read_directory, rename_entry, delete_entry, list_drives, set_watched_paths, compute_tree_stats, cancel_tree_stats, get_extension_icon, clipboard_write_paths, clipboard_read_paths, scan_paste_conflicts, paste_entries])
         .run(tauri::generate_context!())
         .expect("error while running Rove");
 }
